@@ -1,0 +1,195 @@
+import React from 'react'
+import DashboardContent from './DashboardContent/DashboardContent'
+import ErrorMessage from './components/ErrorMessage'
+import db from '../lib/Database/SupaBase/Base'
+import IsAuth from '../Security/IsAuth/IsAuth'
+import { decrypt } from '../Security/Lock/Enc'
+import OctoKitConnect from './components/OctalConnect'
+import { Octokit } from '@octokit/rest'
+
+interface GithubKey {
+  key: string
+  key_data: any
+  user_id: string
+  success: boolean
+}
+
+interface DecryptedGithubKey {
+  key: string
+  key_data: any
+  octokit: Octokit
+}
+
+interface AuthenticatedUser {
+  id: string
+  [key: string]: any
+}
+
+export const getRandomGithubKey = async (userId: string): Promise<DecryptedGithubKey | null> => {
+  try {
+    if (!db) return null
+
+    const { data: githubKeys, error } = await db
+      .from('github_keys')
+      .select('key, key_data')
+      .eq('user_id', userId)
+      .eq('success', true)
+
+    if (error || !githubKeys || githubKeys.length === 0) return null
+
+    const randomIndex = Math.floor(Math.random() * githubKeys.length)
+    const selectedKey = githubKeys[randomIndex]
+
+    const encryptionKey = `${process.env.PASS1}+${process.env.PASS2}+${process.env.PASS3}+${process.env.PASS4}`
+    const decryptedKey = decrypt(selectedKey.key, encryptionKey)
+
+    if (!decryptedKey) return null
+
+    let octokit = await OctoKitConnect({key: decryptedKey})
+    if(!octokit) return null
+
+    return {
+      key: decryptedKey,
+      key_data: selectedKey.key_data,
+      octokit: octokit
+    }
+  } catch {
+    return null
+  }
+}
+
+export const searchExplorerDatabaseRepos = async (octokit: Octokit) => {
+  try {
+    const user = await octokit.users.getAuthenticated()
+    const username = user.data.login
+    
+    const response = await octokit.search.repos({
+      q: `explorer_database user:${username}`,
+      sort: 'updated',
+      order: 'desc',
+      per_page: 10
+    })
+    
+    return response.data.items
+  } catch (error) {
+    console.error('Error searching repositories:', error)
+    return []
+  }
+}
+
+export const getRepoData = async (octokit: Octokit, repo: any) => {
+  try {
+    const [owner, repoName] = repo.full_name.split('/')
+    
+    const getContentsRecursive = async (path: string = ''): Promise<any[]> => {
+      try {
+        const contents = await octokit.repos.getContent({
+          owner,
+          repo: repoName,
+          path
+        })
+        
+        const contentsArray = Array.isArray(contents.data) ? contents.data : [contents.data]
+        
+        const processedContents: any[] = await Promise.all(
+          contentsArray.map(async (item: any) => {
+            if (item.type === 'dir') {
+              const subContents: any[] = await getContentsRecursive(item.path)
+              return subContents
+            }
+            
+            if (item.type === 'file' && item.name.endsWith('.json')) {
+              try {
+                const fileContent = await octokit.repos.getContent({
+                  owner,
+                  repo: repoName,
+                  path: item.path
+                })
+                
+                if ('content' in fileContent.data && fileContent.data.content) {
+
+                  const content = Buffer.from(fileContent.data.content, 'base64').toString('utf-8')
+                  const jsonData = JSON.parse(content)
+                  
+                  return {
+                    ...item,
+                    jsonContent: jsonData
+                  }
+                }
+                
+                return item
+              } catch (error) {
+                console.error(`Error reading JSON file ${item.path}:`, error)
+                return item
+              }
+            }
+            
+            return item
+          })
+        )
+        
+        return processedContents.flat()
+      } catch (error) {
+        console.error(`Error getting contents for path ${path}:`, error)
+        return []
+      }
+    }
+    
+    const allContents = await getContentsRecursive()
+    
+    return {
+      repo: repo,
+      contents: allContents
+    }
+  } catch (error) {
+    console.error(`Error getting data for ${repo.full_name}:`, error)
+    return {
+      repo: repo,
+      contents: null
+    }
+  }
+}
+
+const DashboardPage = async (): Promise<React.JSX.Element> => {
+  try {
+    const authenticatedUser = await IsAuth('c_usr', 'is_auth', '*', true) as AuthenticatedUser
+    
+    if (!authenticatedUser || typeof authenticatedUser === 'boolean') {
+      return <ErrorMessage message="You're not authorized to access this page." />
+    }
+
+    if (!db) {
+      return <ErrorMessage message="Oh no! Something went wrong. Please try again later." />
+    }
+
+    const githubKey = await getRandomGithubKey(authenticatedUser.id)
+    
+    if (!githubKey) {
+      return <ErrorMessage message="No github keys found. Please add a github key to your account." />
+    }
+
+    const explorerRepos = await searchExplorerDatabaseRepos(githubKey.octokit)
+    
+    const reposWithData = await Promise.all(
+      explorerRepos.map(repo => getRepoData(githubKey.octokit, repo))
+    )
+
+    const allContents = reposWithData
+      .map(repoData => repoData.contents)
+      .flat()
+      .filter(content => content !== null && content.jsonContent)
+
+    const allJsonContents = allContents.map(content => content.jsonContent)
+    
+    return <DashboardContent allJsonContents={allJsonContents.flatMap(content => content)} />
+  } catch (error) {
+    console.error('Dashboard Page Error:', error)
+    return (
+      <div className="flex h-screen w-full items-center justify-center">
+        <ErrorMessage message="Error loading dashboard" />
+      </div>
+    )
+  }
+}
+
+export default DashboardPage

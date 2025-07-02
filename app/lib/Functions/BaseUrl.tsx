@@ -1,0 +1,2 @@
+export const BaseUrl = process.env.NODE_ENV === 'development' ? `http://192.168.1.92:3000` : `https://explorer.medzyamara.dev`
+export const FileServerUrl = process.env.NODE_ENV === 'development' ? `http://192.168.1.92:3001` : `https://fileserver.medzyamara.dev`
